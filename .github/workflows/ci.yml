@@ -1,0 +1,112 @@
+# CI da imobo-ms-pkg, a biblioteca Go que os serviços da IMOBO importam.
+#
+# CI quer dizer integração contínua. A cada push na main e a cada pull request,
+# o GitHub liga uma máquina Linux limpa, baixa o código deste repositório e roda
+# os passos abaixo, um depois do outro. Se um passo falha, os seguintes não rodam
+# e o run fica vermelho. Com a proteção da main exigindo este check (ajuste feito
+# nas configurações do repositório, não aqui), PR vermelho não entra.
+#
+# Regra aplicada (LEI-MS #10): teste sempre com o detector de corrida (-race) e
+# cobertura total de 95% ou mais. Os serviços exigem 90%. A lib exige mais porque
+# um erro aqui chega a todos os serviços que a importam.
+#
+# Fora deste CI: os testes com a build tag "integration"
+# (tenantctx/rls_test.go e iauso/postgres_integration_test.go). Eles sobem um
+# Postgres de verdade pelo testcontainers e o `go test ./...` comum os ignora.
+name: ci
+
+# Quando o CI roda: em todo push na main e em todo pull request, venha de qual
+# branch vier.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# O token que o GitHub entrega ao run só pode ler o código. Este CI não publica
+# nada, não comenta em PR e não cria release, então não precisa de mais poder.
+# Menos permissão é menos estrago se uma action de terceiro for comprometida.
+permissions:
+  contents: read
+
+# Um run por branch ou PR de cada vez. Num PR, um push novo cancela o run antigo,
+# porque o resultado dele já não vale para o código atual. Na main nada é
+# cancelado: cada commit da main guarda o próprio resultado.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Variáveis de ambiente que valem para todos os passos.
+env:
+  # Ignora qualquer go.work. A lib compila só com o próprio go.mod, do mesmo jeito
+  # que o proxy do Go a entrega para quem a importa.
+  GOWORK: "off"
+  # Proíbe o comando go de baixar outra versão do Go por conta própria. Vale a
+  # versão que o setup-go instalou, e nenhuma outra.
+  GOTOOLCHAIN: "local"
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      # Baixa o código do commit que disparou o run.
+      - uses: actions/checkout@v4
+
+      # Instala o Go. A versão sai da diretiva "go" do go.mod (hoje 1.25.0), que é
+      # a mínima que a lib promete aos serviços. Testar nela garante que qualquer
+      # serviço nessa versão ou numa mais nova compila a lib. Quando o go.mod
+      # subir de versão, o CI acompanha sem editar este arquivo.
+      # cache: false segue o renave-service. Cada run baixa as dependências do
+      # zero e não herda nada de um run anterior.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      # O gofmt é o formatador oficial do Go. "gofmt -l ." lista os arquivos que
+      # ele formataria diferente. Lista vazia quer dizer código no padrão. Cada
+      # arquivo fora do padrão vira um erro anotado no próprio arquivo, no PR.
+      # Para corrigir na sua máquina: gofmt -w . e um commit novo.
+      - name: Formatação (gofmt -l precisa sair vazio)
+        run: |
+          fora_do_padrao=$(gofmt -l .)
+          if [ -n "$fora_do_padrao" ]; then
+            printf '%s\n' "$fora_do_padrao" | while IFS= read -r arquivo; do
+              echo "::error file=${arquivo}::${arquivo} está fora do padrão do gofmt. Rode gofmt -w ${arquivo}"
+            done
+            exit 1
+          fi
+          echo "gofmt: todos os arquivos no padrão"
+
+      # Compila todos os pacotes. Pega erro de sintaxe, import quebrado e tipo errado.
+      - name: Build
+        run: go build ./...
+
+      # O go vet procura erro que compila mas está errado, como formato de Printf
+      # que não bate com o argumento ou cópia de um sync.Mutex.
+      - name: Vet
+        run: go vet ./...
+
+      # Roda todos os testes com -race. O detector de corrida avisa quando duas
+      # goroutines mexem na mesma memória sem sincronização, um tipo de bug que
+      # quase nunca aparece no teste comum e aparece em produção.
+      - name: Testes com -race (todos os pacotes)
+        run: go test -race ./...
+
+      # Mede a cobertura, isto é, a fração das instruções do código que algum
+      # teste executou, e barra o run abaixo de 95%.
+      # -covermode=atomic conta as execuções de forma segura entre goroutines.
+      # A saída do go test já traz uma linha por pacote com a cobertura dele.
+      # O relatório por função fica num grupo recolhido do log, para quem quiser
+      # achar o trecho sem teste.
+      # O awk lê a linha "total:" do relatório, tira o "%" e compara com 95.
+      # O nome vai entre aspas porque, sem elas, o YAML leria " #10" como início
+      # de comentário e cortaria o nome do passo ali.
+      - name: "Gate de cobertura total (>= 95%, LEI-MS #10)"
+        run: |
+          go test -covermode=atomic -coverprofile=cover.out ./...
+          echo "::group::Cobertura por função"
+          go tool cover -func=cover.out
+          echo "::endgroup::"
+          total=$(go tool cover -func=cover.out | awk '/^total:/ {print substr($3,1,length($3)-1)}')
+          echo "imobo-ms-pkg cobertura total: ${total}%"
+          awk -v c="$total" 'BEGIN { exit (c+0 >= 95.0) ? 0 : 1 }' || { echo "::error::cobertura total ${total}% < 95% (LEI-MS #10)"; exit 1; }
